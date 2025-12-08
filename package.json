@@ -1,0 +1,10 @@
+{
+  "watch": [
+    "*.py"
+  ],
+  "ext": "py",
+  "exec": "python app.py",
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
