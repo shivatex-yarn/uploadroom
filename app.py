@@ -1,91 +1,98 @@
-# --------------------------------------------------------------
-# app.py – Wallpaper Visualizer (MASK-ONLY, NO DIMMING)
-# --------------------------------------------------------------
-from flask import Flask, request, send_file, jsonify
-from flask_cors import CORS
-from PIL import Image
-import io
+# app.py
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from io import BytesIO
+import cv2
+import numpy as np
+import httpx
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
-app = Flask(__name__)
-CORS(app)
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-MAX_SIZE = 1200
+print("Loading SAM model...")
+sam = sam_model_registry["vit_h"](checkpoint="checkpoints/sam_vit_h_4b8939.pth")
+mask_generator = SamAutomaticMaskGenerator(sam, points_per_side=32, pred_iou_thresh=0.88, stability_score_thresh=0.95)
+print("SAM loaded!")
 
+def detect_walls(img):
+    h, w = img.shape[:2]
+    masks = mask_generator.generate(img)
+    candidates = [(m["bbox"][0] + m["bbox"][2]/2, m["area"], m) for m in masks if m["area"] > 8000]
+    candidates.sort(key=lambda x: x[1], reverse=True)
 
-def resize_to_match(base_img: Image.Image, img: Image.Image) -> Image.Image:
-    """Resize img to match base_img size."""
-    if img.size != base_img.size:
-        return img.resize(base_img.size, Image.LANCZOS)
-    return img
+    walls = {}
+    positions = {"left": False, "center": False, "right": False}
 
+    for cx, area, m in candidates:
+        if cx < w * 0.35 and not positions["left"]:
+            pos = "left"
+        elif cx > w * 0.65 and not positions["right"]:
+            pos = "right"
+        elif not positions["center"]:
+            pos = "center"
+        else:
+            continue
 
-def tile_wallpaper(wallpaper_img: Image.Image, target_size: tuple) -> Image.Image:
-    """Tile wallpaper to fill target size using Pillow."""
-    wp_w, wp_h = wallpaper_img.size
-    target_w, target_h = target_size
+        mask = m["segmentation"].astype(np.uint8) * 255
+        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        walls[pos] = mask
+        positions[pos] = True
+        if len(walls) == 3:
+            break
+    return walls
 
-    tiled = Image.new("RGBA", target_size)
-    for x in range(0, target_w, wp_w):
-        for y in range(0, target_h, wp_h):
-            tiled.paste(wallpaper_img, (x, y))
+@app.post("/upload")
+async def upload(file: UploadFile):
+    data = await file.read()
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(400, "Invalid image")
+    walls = detect_walls(img)
+    return {"walls": list(walls.keys())}
 
-    return tiled.crop((0, 0, target_w, target_h))
+@app.post("/apply")
+async def apply(
+    room: UploadFile = File(...),
+    wallpaper_left_url: str = Form(None),
+    wallpaper_center_url: str = Form(None),
+    wallpaper_right_url: str = Form(None),
+):
+    # Load room
+    room_bytes = await room.read()
+    room_img = cv2.imdecode(np.frombuffer(room_bytes, np.uint8), cv2.IMREAD_COLOR)
+    h, w = room_img.shape[:2]
 
+    # Download wallpaper from URL (server-side → no CORS)
+    async def download(url):
+        if not url:
+            return None
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, timeout=30.0)
+            r.raise_for_status()
+            arr = np.frombuffer(r.content, np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            return cv2.resize(img, (w, h)) if img is not None else None
 
-def apply_wallpaper(template_img: Image.Image,
-                    wallpaper_img: Image.Image,
-                    mask_img: Image.Image) -> Image.Image:
-    """
-    Apply wallpaper only inside white regions of mask.
-    - template_img: RGBA (room)
-    - wallpaper_img: RGB (pattern)
-    - mask_img: L (white = wall)
-    """
-    base = template_img.convert("RGBA")
-    wp = wallpaper_img.convert("RGB")
-    mask = mask_img.convert("L")
+    wp_left = await download(wallpaper_left_url)
+    wp_center = await download(wallpaper_center_url)
+    wp_right = await download(wallpaper_right_url)
 
-    # Resize everything to match
-    wp = resize_to_match(base, wp)
-    mask = resize_to_match(base, mask)
+    wallpapers = {"left": wp_left, "center": wp_center, "right": wp_right}
+    masks = detect_walls(room_img)
+    result = room_img.astype(np.float32)
 
-    # Tile wallpaper to cover full canvas
-    tiled = tile_wallpaper(wp.convert("RGBA"), base.size)
+    for pos, mask in masks.items():
+        wp = wallpapers.get(pos)
+        if wp is not None:
+            mask3 = np.repeat(mask[:, :, None], 3, axis=2) / 255.0
+            result = result * (1 - mask3) + wp.astype(np.float32) * mask3
 
-    # --- Key Fix ---
-    # We want wallpaper to appear *on white mask*,
-    # keeping the rest of the room as-is.
-    # So wallpaper = foreground, base = background.
-    result = Image.composite(tiled, base, mask)
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    _, buf = cv2.imencode(".jpg", result, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    return StreamingResponse(BytesIO(buf.tobytes()), media_type="image/jpeg")
 
-    return result
-
-
-@app.route("/apply-wallpaper", methods=["POST"])
-def apply():
-    try:
-        required = ["template", "wallpaper", "mask"]
-        if not all(k in request.files for k in required):
-            return jsonify({"error": "Missing template, wallpaper, or mask"}), 400
-
-        template = Image.open(request.files["template"].stream).convert("RGBA")
-        wallpaper = Image.open(request.files["wallpaper"].stream).convert("RGB")
-        mask = Image.open(request.files["mask"].stream).convert("L")
-
-        print(f"[DEBUG] Template: {template.size} | Wallpaper: {wallpaper.size} | Mask: {mask.size}")
-
-        result = apply_wallpaper(template, wallpaper, mask)
-
-        bio = io.BytesIO()
-        result.save(bio, format="PNG")
-        bio.seek(0)
-        return send_file(bio, mimetype="image/png")
-
-    except Exception as e:
-        print("[ERROR]", e)
-        return jsonify({"error": str(e)}), 500
-
-
-if __name__ == "__main__":
-    print("✅ Wallpaper backend running → http://127.0.0.1:5000")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+@app.get("/")
+def home():
+    return {"status": "Magic View API Ready!"}

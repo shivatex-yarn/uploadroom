@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: reimagine_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: project-reimagine-wallpaper
+      POSTGRES_PASSWORD: 2712
+      POSTGRES_DB: client
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wallpaper_app
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+    ports:
+      - "5000:5000"
+    volumes:
+      - .:/app
+      - ./checkpoints:/app/checkpoints # SAM checkpoint folder
+    command: >
+      sh -c "
+      python -m prisma generate &&
+      uvicorn app:app --host 0.0.0.0 --port 5000 --reload
+      "
+
+volumes:
+  pgdata:

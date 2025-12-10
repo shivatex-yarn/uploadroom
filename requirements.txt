@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+python-multipart
+Pillow
+requests
+prisma
+psycopg2-binary
+boto3

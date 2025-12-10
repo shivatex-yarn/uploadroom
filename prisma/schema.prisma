@@ -1,0 +1,19 @@
+generator client {
+  provider = "prisma-client-py"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model UploadedImage {
+  id           Int     @id @default(autoincrement())
+  createdAt    DateTime @default(now())
+  original     Bytes
+  mask_combined Bytes?
+  wall_left    Bytes?
+  wall_center  Bytes?
+  wall_right   Bytes?
+  result       Bytes?
+}
